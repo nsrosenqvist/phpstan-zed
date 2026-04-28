@@ -1,0 +1,11 @@
+id = "phpstan"
+name = "PHPStan"
+description = "PHPStan static analysis diagnostics for PHP"
+version = "0.1.0"
+schema_version = 1
+authors = ["Niklas Rosenqvist"]
+repository = "https://github.com/nsrosenqvist/phpstan-zed"
+
+[language_servers.phpstan]
+name = "PHPStan"
+languages = ["PHP"]

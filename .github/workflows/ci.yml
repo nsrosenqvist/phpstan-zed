@@ -1,0 +1,43 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: none
+      - name: Install PHPStan
+        shell: bash
+        run: |
+          mkdir -p target/test-tools
+          curl -sSfL -o target/test-tools/phpstan.phar \
+            https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          php target/test-tools/phpstan.phar --version
+          echo "PHPSTAN_BIN=$PWD/target/test-tools/phpstan.phar" >> "$GITHUB_ENV"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (host)
+        run: cargo test --workspace
+      - name: Build extension (wasm)
+        run: cargo build -p phpstan-zed --target wasm32-wasip2 --release

@@ -1,0 +1,187 @@
+name: Release
+
+# Tag-driven releases for the phpstan-lsp-bridge binaries.
+#
+# Trigger: push of a semver tag (e.g. v1.2.3, v1.2.3-rc.1).
+# A pre-release tag (any tag containing a `-`, like v1.2.3-rc.1) marks the
+# GitHub release as a pre-release.
+#
+# IMPORTANT: the asset names produced here are the contract consumed by
+# `extension::phpstan_server::bridge_asset_name`. If you change the matrix
+# or the archive naming below, mirror it there (and in the snapshot test
+# `bridge_asset_name_matrix`).
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build bridge (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    outputs:
+      is_prerelease: ${{ steps.detect.outputs.is_prerelease }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Detect version and pre-release
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Patch versions from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.detect.outputs.version }}"
+          # Patch the first `version = "..."` line in each manifest. The
+          # workspace Cargo.toml has it under [workspace.package] (which is
+          # always the first such line), and extension.toml has it at the
+          # top level. BSD sed (macOS) needs an empty backup extension on
+          # `-i`; GNU sed (Linux) and Git-Bash sed (Windows) do not.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            SED_INPLACE=(sed -i '')
+          else
+            SED_INPLACE=(sed -i)
+          fi
+          "${SED_INPLACE[@]}" \
+            "1,/^version = .*/s/^version = .*/version = \"${VERSION}\"/" \
+            Cargo.toml
+          "${SED_INPLACE[@]}" \
+            "1,/^version = .*/s/^version = .*/version = \"${VERSION}\"/" \
+            extension/extension.toml
+          # Sanity check.
+          grep -E "^version = \"${VERSION}\"$" Cargo.toml >/dev/null
+          grep -E "^version = \"${VERSION}\"$" extension/extension.toml >/dev/null
+
+      - name: Install cross (linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - name: Build bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The release profile in Cargo.toml already enables `strip = true`,
+          # so we get stripped binaries for free across all targets.
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build -p phpstan-lsp-bridge --release --target ${{ matrix.target }}
+          else
+            cargo build -p phpstan-lsp-bridge --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="phpstan-lsp-bridge-${{ matrix.target }}"
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp target/${{ matrix.target }}/release/phpstan-lsp-bridge.exe dist/
+            (cd dist && 7z a "${NAME}.zip" phpstan-lsp-bridge.exe >/dev/null)
+            rm dist/phpstan-lsp-bridge.exe
+          else
+            cp target/${{ matrix.target }}/release/phpstan-lsp-bridge dist/
+            (cd dist && tar -czf "${NAME}.tar.gz" phpstan-lsp-bridge)
+            rm dist/phpstan-lsp-bridge
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all bridge artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bridge-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # Hash both .tar.gz and .zip files. `shasum -a 256` is portable,
+          # but ubuntu-latest has GNU coreutils so sha256sum is fine.
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+
+      - name: Build changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Find the previous semver tag, ignoring floating tags such as
+          # `v0` or `v0.2` should we ever introduce them.
+          PREV_TAG=$(git tag --list 'v*.*.*' --sort=-v:refname \
+            | grep -v "^${GITHUB_REF_NAME}$" | head -n 1 || true)
+
+          {
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              git log "${PREV_TAG}..${GITHUB_REF_NAME}" \
+                --pretty=format:"- %s (%h)" --no-merges
+              echo ""
+              echo ""
+              echo "**Full Changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
+            else
+              git log "${GITHUB_REF_NAME}" \
+                --pretty=format:"- %s (%h)" --no-merges
+              echo ""
+            fi
+          } > release_notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          prerelease: ${{ needs.build.outputs.is_prerelease == 'true' }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
